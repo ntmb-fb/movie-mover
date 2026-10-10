@@ -249,9 +249,10 @@ fn main() {
             Ok(entries) => {
                 for entry in entries.flatten() {
                     let name = entry.file_name().to_string_lossy().into_owned();
-                    // _UNPACK_ and _FAILED_ are SABnzbd's unfinished and failed jobs.
+                    // _UNPACK_ and _FAILED_ are SABnzbd's unfinished and failed jobs,
+                    // @eaDir and #recycle are Synology's own folders.
                     if name == "nzb"
-                        || [".", "_UNPACK_", "_FAILED_"]
+                        || [".", "@", "#", "_UNPACK_", "_FAILED_"]
                             .iter()
                             .any(|p| name.starts_with(p))
                     {
