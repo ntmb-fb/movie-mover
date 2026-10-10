@@ -16,8 +16,6 @@ struct Config {
     log_dir: Option<PathBuf>,
 }
 
-const LOG_DAYS: u64 = 30;
-
 /// UTC "YYYY-MM-DD HH:MM:SS" for seconds since 1970 (days-to-date by Howard Hinnant).
 fn timestamp(secs: u64) -> String {
     let (days, rem) = (secs / 86400 + 719_468, secs % 86400);
@@ -39,10 +37,11 @@ fn unix_now() -> u64 {
 
 const LOG_FILE: &str = "movie-mover.log";
 
-/// Drop the log lines older than LOG_DAYS. Every line starts with its timestamp.
-fn prune_log(dir: &Path, now: u64) -> io::Result<()> {
+/// Drop the log lines written before `oldest` (seconds since 1970).
+/// Every line starts with its timestamp.
+fn prune_log(dir: &Path, oldest: u64) -> io::Result<()> {
     let file = dir.join(LOG_FILE);
-    let oldest = timestamp(now.saturating_sub(LOG_DAYS * 86400));
+    let oldest = timestamp(oldest);
     let text = fs::read_to_string(&file)?;
     let kept: String = text
         .split_inclusive('\n')
@@ -288,6 +287,7 @@ fn main() {
             .filter(|dir| dir.is_dir()),
     };
     let interval = var("INTERVAL").and_then(|v| v.parse().ok()).unwrap_or(30);
+    let log_days: u64 = var("LOG_DAYS").and_then(|v| v.parse().ok()).unwrap_or(60);
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(15)))
         .build()
@@ -310,7 +310,10 @@ fn main() {
         // Once a day is enough.
         let today = timestamp(unix_now())[..10].to_string();
         if let Some(dir) = cfg.log_dir.as_ref().filter(|_| today != pruned_day) {
-            let _ = prune_log(dir, unix_now());
+            let _ = prune_log(
+                dir,
+                unix_now().saturating_sub(log_days.saturating_mul(86400)),
+            );
             pruned_day = today;
         }
         let mut now = HashMap::new();
@@ -558,7 +561,7 @@ mod tests {
             log_dir: Some(dir.clone()),
         };
         cfg.log("hello".into());
-        prune_log(&dir, now).unwrap();
+        prune_log(&dir, now - 30 * 86400).unwrap();
         let text = fs::read_to_string(dir.join(LOG_FILE)).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "{text}");

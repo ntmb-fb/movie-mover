@@ -13,5 +13,6 @@ ENV SRC=/Download/complete \
     TMDB_TOKEN="" \
     INTERVAL=30 \
     DRY_RUN="" \
-    LOG_DIR=/data
+    LOG_DIR=/data \
+    LOG_DAYS=60
 ENTRYPOINT ["/movie-mover"]
