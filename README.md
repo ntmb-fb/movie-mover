@@ -10,6 +10,7 @@ Watches a download folder and moves each finished download into a library:
 - Subtitles (`srt sub idx ass`) move with the movie. The rest of the download folder is deleted.
 - An existing movie folder is never overwritten.
 - Left alone: movies without a year in the name, with no video, or with more than one file over 100 MB.
+- Music: a download with audio files (`flac mp3 m4a wav ...`) is always left alone.
 - Episodes: a season pack is moved file by file. A show folder that already exists is reused,
   whatever its case or punctuation. Without a series folder episodes are left alone.
 

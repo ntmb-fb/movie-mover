@@ -9,6 +9,9 @@ use std::{env, fs, io, thread};
 
 const VIDEO: &[&str] = &["mkv", "mp4", "avi", "m4v", "mov", "ts", "wmv"];
 const SUBS: &[&str] = &["srt", "sub", "idx", "ass"];
+const MUSIC: &[&str] = &[
+    "flac", "mp3", "m4a", "wav", "ogg", "opus", "ape", "wma", "aiff", "dsf",
+];
 // Videos below this size are samples.
 const BIG: u64 = 100 * 1024 * 1024;
 
@@ -388,6 +391,10 @@ fn process(cfg: &Config, agent: &ureq::Agent, entry: &Path, files: &Files) -> io
     } else {
         stem(entry)
     };
+    // An album can hold a video and a year in its name; it must not be taken for a movie.
+    if files.iter().any(|(p, _)| MUSIC.contains(&ext(p).as_str())) {
+        return Ok("music, left alone".into());
+    }
     let is_episode = |name: &str| parse_episode(name).is_some();
     if is_episode(&entry_name)
         || files
@@ -847,6 +854,12 @@ mod tests {
         process(&cfg, &agent, &dir, &files).unwrap();
         assert!(movie.join("Some Movie (2020).mkv").exists() && !dir.exists());
         fs::remove_dir_all(&movie).unwrap();
+
+        // An album with a bonus video and a year in its name stays where it is.
+        let (dir, files) = job(&root, &["01 - track.flac", "bonus.mp4"]);
+        process(&cfg, &agent, &dir, &files).unwrap();
+        assert!(dir.join("01 - track.flac").exists() && !movie.exists());
+        fs::remove_dir_all(&dir).unwrap();
 
         // An interrupted copy is redone; clashing subtitles keep the source folder.
         fs::create_dir_all(&movie).unwrap();
