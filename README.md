@@ -18,11 +18,11 @@ Watches a download folder and moves each finished movie into a library as
 | `TMDB_TOKEN` | empty | TMDB "API Read Access Token". Empty turns TMDB off |
 | `INTERVAL` | `30` | Seconds between scans |
 | `DRY_RUN` | empty | Any value except `0`: log the moves, change nothing |
-| `LOG_DIR` | `/data` | Folder for the log files. Not mapped: log to stdout only |
+| `LOG_DIR` | `/data` | Folder for the log file. Not mapped: log to stdout only |
 
 An entry is processed when its size and timestamps are the same in two scans in a row.
-The log goes to stdout and to `LOG_DIR/movie-mover-YYYY-MM-DD.log`, one file per day (UTC).
-Files older than 30 days are deleted.
+The log goes to stdout and to `LOG_DIR/movie-mover.log` (times in UTC).
+Lines older than 30 days are removed.
 
 A manual copy that stalls longer than `INTERVAL` looks finished; raise `INTERVAL` if that happens.
 

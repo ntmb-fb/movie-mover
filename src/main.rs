@@ -37,28 +37,33 @@ fn unix_now() -> u64 {
     now.unwrap_or_default().as_secs()
 }
 
-fn log_name(secs: u64) -> String {
-    format!("movie-mover-{}.log", &timestamp(secs)[..10])
-}
+const LOG_FILE: &str = "movie-mover.log";
 
-/// Delete the daily log files older than LOG_DAYS. The date is in the name.
-fn prune_logs(dir: &Path, now: u64) {
-    let oldest = log_name(now.saturating_sub(LOG_DAYS * 86400));
-    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with("movie-mover-") && name.ends_with(".log") && name < oldest {
-            let _ = fs::remove_file(entry.path());
-        }
+/// Drop the log lines older than LOG_DAYS. Every line starts with its timestamp.
+fn prune_log(dir: &Path, now: u64) -> io::Result<()> {
+    let file = dir.join(LOG_FILE);
+    let oldest = timestamp(now.saturating_sub(LOG_DAYS * 86400));
+    let text = fs::read_to_string(&file)?;
+    let kept: String = text
+        .split_inclusive('\n')
+        .filter(|line| *line >= oldest.as_str())
+        .collect();
+    if kept.len() < text.len() {
+        // Write beside it and rename: a crash never leaves half a log.
+        let partial = dir.join("movie-mover.log.partial");
+        fs::write(&partial, kept)?;
+        fs::rename(partial, file)?;
     }
+    Ok(())
 }
 
 impl Config {
-    /// To stdout (the container log) and, with a log folder, to one file per day.
+    /// To stdout (the container log) and, with a log folder, to the log file.
     fn log(&self, line: String) {
         println!("{line}");
         let Some(dir) = &self.log_dir else { return };
         let now = unix_now();
-        let file = dir.join(log_name(now));
+        let file = dir.join(LOG_FILE);
         let written = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -300,9 +305,13 @@ fn main() {
     // shortcut: a manual copy that stalls longer than INTERVAL looks finished,
     // raise INTERVAL if a hand-copied movie ever arrives cut short.
     let mut seen = HashMap::new();
+    let mut pruned_day = String::new();
     loop {
-        if let Some(dir) = &cfg.log_dir {
-            prune_logs(dir, unix_now());
+        // Once a day is enough.
+        let today = timestamp(unix_now())[..10].to_string();
+        if let Some(dir) = cfg.log_dir.as_ref().filter(|_| today != pruned_day) {
+            let _ = prune_log(dir, unix_now());
+            pruned_day = today;
         }
         let mut now = HashMap::new();
         match fs::read_dir(&src) {
@@ -530,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_and_prunes_daily_logs() {
+    fn writes_and_prunes_the_log() {
         assert_eq!(timestamp(0), "1970-01-01 00:00:00");
         assert_eq!(timestamp(1_700_000_000), "2023-11-14 22:13:20");
         assert_eq!(timestamp(1_709_164_800), "2024-02-29 00:00:00");
@@ -538,6 +547,10 @@ mod tests {
         let dir = env::temp_dir().join(format!("movie-mover-log-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
+        let now = unix_now();
+        let (old, recent) = (timestamp(now - 31 * 86400), timestamp(now - 29 * 86400));
+        fs::write(dir.join(LOG_FILE), format!("{old} old\n{recent} recent\n")).unwrap();
+
         let cfg = Config {
             dst: dir.clone(),
             token: None,
@@ -545,17 +558,12 @@ mod tests {
             log_dir: Some(dir.clone()),
         };
         cfg.log("hello".into());
-        let now = unix_now();
-        let today = fs::read_to_string(dir.join(log_name(now))).unwrap();
-        assert!(today.ends_with(" hello\n"), "{today}");
-
-        let (old, kept) = (log_name(now - 31 * 86400), log_name(now - 29 * 86400));
-        for name in [old.as_str(), kept.as_str(), "notes.txt"] {
-            fs::write(dir.join(name), "x").unwrap();
-        }
-        prune_logs(&dir, now);
-        assert!(!dir.join(&old).exists());
-        assert!(dir.join(&kept).exists() && dir.join("notes.txt").exists());
+        prune_log(&dir, now).unwrap();
+        let text = fs::read_to_string(dir.join(LOG_FILE)).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert_eq!(lines[0], format!("{recent} recent"));
+        assert!(lines[1].ends_with(" hello"));
         fs::remove_dir_all(&dir).unwrap();
     }
 }
