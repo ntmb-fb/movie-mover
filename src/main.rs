@@ -286,7 +286,11 @@ fn main() {
         log_dir: Some(PathBuf::from(var("LOG_DIR").unwrap_or("/data".into())))
             .filter(|dir| dir.is_dir()),
     };
-    let interval = var("INTERVAL").and_then(|v| v.parse().ok()).unwrap_or(30);
+    // At least 1: a pause of 0 would scan without a break.
+    let interval: u64 = var("INTERVAL")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30)
+        .max(1);
     let log_days: u64 = var("LOG_DAYS").and_then(|v| v.parse().ok()).unwrap_or(60);
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(15)))
@@ -310,10 +314,14 @@ fn main() {
         // Once a day is enough.
         let today = timestamp(unix_now())[..10].to_string();
         if let Some(dir) = cfg.log_dir.as_ref().filter(|_| today != pruned_day) {
-            let _ = prune_log(
-                dir,
-                unix_now().saturating_sub(log_days.saturating_mul(86400)),
-            );
+            let oldest = unix_now().saturating_sub(log_days.saturating_mul(86400));
+            match prune_log(dir, oldest) {
+                // No log file yet is normal on the first start.
+                Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                    cfg.log(format!("cannot trim the log: {e}"))
+                }
+                _ => {}
+            }
             pruned_day = today;
         }
         let mut now = HashMap::new();
