@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use std::{env, fs, io, thread};
@@ -12,6 +13,61 @@ struct Config {
     dst: PathBuf,
     token: Option<String>,
     dry_run: bool,
+    log_dir: Option<PathBuf>,
+}
+
+const LOG_DAYS: u64 = 30;
+
+/// UTC "YYYY-MM-DD HH:MM:SS" for seconds since 1970 (days-to-date by Howard Hinnant).
+fn timestamp(secs: u64) -> String {
+    let (days, rem) = (secs / 86400 + 719_468, secs % 86400);
+    let (era, doe) = (days / 146_097, days % 146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + u64::from(month <= 2);
+    let (h, m, s) = (rem / 3600, rem % 3600 / 60, rem % 60);
+    format!("{year:04}-{month:02}-{day:02} {h:02}:{m:02}:{s:02}")
+}
+
+fn unix_now() -> u64 {
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH);
+    now.unwrap_or_default().as_secs()
+}
+
+fn log_name(secs: u64) -> String {
+    format!("movie-mover-{}.log", &timestamp(secs)[..10])
+}
+
+/// Delete the daily log files older than LOG_DAYS. The date is in the name.
+fn prune_logs(dir: &Path, now: u64) {
+    let oldest = log_name(now.saturating_sub(LOG_DAYS * 86400));
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("movie-mover-") && name.ends_with(".log") && name < oldest {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+impl Config {
+    /// To stdout (the container log) and, with a log folder, to one file per day.
+    fn log(&self, line: String) {
+        println!("{line}");
+        let Some(dir) = &self.log_dir else { return };
+        let now = unix_now();
+        let file = dir.join(log_name(now));
+        let written = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&file)
+            .and_then(|mut f| writeln!(f, "{} {line}", timestamp(now)));
+        if let Err(e) = written {
+            eprintln!("cannot write {}: {e}", file.display());
+        }
+    }
 }
 
 type Files = Vec<(PathBuf, fs::Metadata)>;
@@ -56,10 +112,7 @@ fn parse(name: &str) -> Option<(String, String)> {
     let clean = name.replace(['.', '_', '(', ')', '[', ']'], " ");
     let tokens: Vec<&str> = clean.split_whitespace().collect();
     // No future years: "Blade Runner 2049 1080p" has no release year.
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let next_year = 1971 + now.as_secs() / 31_556_952;
+    let next_year = 1971 + unix_now() / 31_556_952;
     let is_year = |t: &&str| {
         t.len() == 4
             && t.parse()
@@ -164,8 +217,10 @@ fn process(cfg: &Config, agent: &ureq::Agent, entry: &Path, files: &Files) -> io
     if let Some(token) = &cfg.token {
         match tmdb(agent, token, &title, &year) {
             Ok(Some(found)) => (title, year) = found,
-            Ok(None) => println!("{entry_name}: no TMDB match, using parsed name"),
-            Err(e) => println!("{entry_name}: TMDB failed ({e}), using parsed name"),
+            Ok(None) => cfg.log(format!("{entry_name}: no TMDB match, using parsed name")),
+            Err(e) => cfg.log(format!(
+                "{entry_name}: TMDB failed ({e}), using parsed name"
+            )),
         }
     }
 
@@ -223,19 +278,22 @@ fn main() {
         dst: var("DST").unwrap_or("/film".into()).into(),
         token: var("TMDB_TOKEN"),
         dry_run: var("DRY_RUN").is_some_and(|v| v != "0"),
+        // Only when the folder is there: without a mapping the log stays on stdout.
+        log_dir: Some(PathBuf::from(var("LOG_DIR").unwrap_or("/data".into())))
+            .filter(|dir| dir.is_dir()),
     };
     let interval = var("INTERVAL").and_then(|v| v.parse().ok()).unwrap_or(30);
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(15)))
         .build()
         .into();
-    println!(
+    cfg.log(format!(
         "watching {} -> {} every {interval}s, TMDB {}{}",
         src.display(),
         cfg.dst.display(),
         if cfg.token.is_some() { "on" } else { "off" },
         if cfg.dry_run { ", dry run" } else { "" },
-    );
+    ));
 
     // Entry -> (signature, already handled). An entry is handled once its
     // signature is the same in two scans in a row.
@@ -243,9 +301,12 @@ fn main() {
     // raise INTERVAL if a hand-copied movie ever arrives cut short.
     let mut seen = HashMap::new();
     loop {
+        if let Some(dir) = &cfg.log_dir {
+            prune_logs(dir, unix_now());
+        }
         let mut now = HashMap::new();
         match fs::read_dir(&src) {
-            Err(e) => println!("cannot read {}: {e}", src.display()),
+            Err(e) => cfg.log(format!("cannot read {}: {e}", src.display())),
             Ok(entries) => {
                 for entry in entries.flatten() {
                     let name = entry.file_name().to_string_lossy().into_owned();
@@ -261,7 +322,7 @@ fn main() {
                     let path = entry.path();
                     let mut files = Files::new();
                     if let Err(e) = walk(&path, &mut files) {
-                        println!("{name}: cannot read: {e}");
+                        cfg.log(format!("{name}: cannot read: {e}"));
                         continue;
                     }
                     let sig = signature(&files);
@@ -270,12 +331,12 @@ fn main() {
                             *handled
                                 || match process(&cfg, &agent, &path, &files) {
                                     Ok(line) => {
-                                        println!("{name}: {line}");
+                                        cfg.log(format!("{name}: {line}"));
                                         true
                                     }
                                     // Not marked as handled: tried again on the next scan.
                                     Err(e) => {
-                                        println!("{name}: error: {e}");
+                                        cfg.log(format!("{name}: error: {e}"));
                                         false
                                     }
                                 }
@@ -362,6 +423,7 @@ mod tests {
             dst: root.join("film"),
             token: None,
             dry_run: true,
+            log_dir: None,
         };
         let agent = ureq::Agent::new_with_defaults();
         let mut files = Files::new();
@@ -412,6 +474,7 @@ mod tests {
             dst: root.join("film"),
             token: None,
             dry_run: false,
+            log_dir: None,
         };
         let agent = ureq::Agent::new_with_defaults();
         let movie = root.join("film/S/Some Movie (2020)");
@@ -464,5 +527,35 @@ mod tests {
         assert_eq!(fs::read_to_string(&to).unwrap(), "video");
         assert!(!from.exists() && !root.join("to.mkv.partial").exists());
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn writes_and_prunes_daily_logs() {
+        assert_eq!(timestamp(0), "1970-01-01 00:00:00");
+        assert_eq!(timestamp(1_700_000_000), "2023-11-14 22:13:20");
+        assert_eq!(timestamp(1_709_164_800), "2024-02-29 00:00:00");
+
+        let dir = env::temp_dir().join(format!("movie-mover-log-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cfg = Config {
+            dst: dir.clone(),
+            token: None,
+            dry_run: true,
+            log_dir: Some(dir.clone()),
+        };
+        cfg.log("hello".into());
+        let now = unix_now();
+        let today = fs::read_to_string(dir.join(log_name(now))).unwrap();
+        assert!(today.ends_with(" hello\n"), "{today}");
+
+        let (old, kept) = (log_name(now - 31 * 86400), log_name(now - 29 * 86400));
+        for name in [old.as_str(), kept.as_str(), "notes.txt"] {
+            fs::write(dir.join(name), "x").unwrap();
+        }
+        prune_logs(&dir, now);
+        assert!(!dir.join(&old).exists());
+        assert!(dir.join(&kept).exists() && dir.join("notes.txt").exists());
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

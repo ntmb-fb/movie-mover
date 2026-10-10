@@ -11,3 +11,4 @@ services:
     volumes:
       - /volume1/download/complete:/Download/complete
       - /volume1/film:/film
+      - /volume1/docker/movie-mover:/data
