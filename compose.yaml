@@ -1,0 +1,13 @@
+services:
+  movie-mover:
+    image: ghcr.io/ntmb-fb/movie-mover:latest
+    restart: unless-stopped
+    init: true
+    # uid:gid that owns the shares (the PUID/PGID of your other containers).
+    user: "1026:100"
+    environment:
+      TMDB_TOKEN: ""
+      DRY_RUN: "1"
+    volumes:
+      - /volume1/Download/complete:/Download/complete
+      - /volume1/film:/film
