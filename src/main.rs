@@ -1,6 +1,9 @@
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, SystemTime};
 use std::{env, fs, io, thread};
 
@@ -9,8 +12,10 @@ const SUBS: &[&str] = &["srt", "sub", "idx", "ass"];
 // Videos below this size are samples.
 const BIG: u64 = 100 * 1024 * 1024;
 
+#[derive(Default)]
 struct Config {
     dst: PathBuf,
+    series: PathBuf,
     token: Option<String>,
     dry_run: bool,
     log_dir: Option<PathBuf>,
@@ -110,14 +115,57 @@ fn signature(files: &Files) -> (usize, u64, SystemTime) {
     (files.len(), size, newest.unwrap_or(SystemTime::UNIX_EPOCH))
 }
 
+/// A release name split into its words.
+fn words(name: &str) -> Vec<String> {
+    let clean = name.replace(['.', '_', '(', ')', '[', ']'], " ");
+    clean.split_whitespace().map(String::from).collect()
+}
+
+/// "S01E02", "s1e2" or "S01E02E03" -> (1, "S01E02"). Anything else is no episode.
+fn episode_code(word: &str) -> Option<(u32, String)> {
+    let upper = word.to_uppercase();
+    let (season, episodes) = upper.strip_prefix('S')?.split_once('E')?;
+    let number = |s: &str| (1..=3).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit());
+    if !number(season) || !episodes.split('E').all(number) {
+        return None;
+    }
+    let season: u32 = season.parse().ok()?;
+    let episodes: String = episodes.split('E').map(|e| format!("E{e:0>2}")).collect();
+    Some((season, format!("S{season:02}{episodes}")))
+}
+
+/// "Shogun.2024.S01E02.1080p" -> ("Shogun 2024", 1, "S01E02").
+fn parse_episode(name: &str) -> Option<(String, u32, String)> {
+    let words = words(name);
+    let (i, (season, code)) = words
+        .iter()
+        .enumerate()
+        .find_map(|(i, word)| Some((i, episode_code(word)?)))?;
+    Some((words[..i].join(" "), season, code))
+}
+
+/// The folder in `dir` with the same name as `name`, ignoring case and punctuation.
+fn existing_folder(dir: &Path, name: &str) -> Option<String> {
+    let plain = |s: &str| -> String {
+        let letters = s.chars().filter(|c| c.is_alphanumeric());
+        letters.flat_map(char::to_lowercase).collect()
+    };
+    let wanted = plain(name);
+    fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .find(|folder| !wanted.is_empty() && plain(folder) == wanted)
+}
+
 /// "Fall.2.Deadpoint.2026.Hybrid.2160p" -> ("Fall 2 Deadpoint", "2026").
 /// The year is the last 19xx/20xx token, so "1922 (2017)" keeps "1922" as title.
 fn parse(name: &str) -> Option<(String, String)> {
-    let clean = name.replace(['.', '_', '(', ')', '[', ']'], " ");
-    let tokens: Vec<&str> = clean.split_whitespace().collect();
+    let tokens = words(name);
     // No future years: "Blade Runner 2049 1080p" has no release year.
     let next_year = 1971 + unix_now() / 31_556_952;
-    let is_year = |t: &&str| {
+    let is_year = |t: &String| {
         t.len() == 4
             && t.parse()
                 .is_ok_and(|y: u64| (1900..=next_year).contains(&y))
@@ -147,24 +195,29 @@ fn bucket(title: &str) -> String {
     }
 }
 
-/// Official title and release year of the first TMDB match.
+/// Official title and first year of the first TMDB match. `kind` is "movie" or "tv".
 fn tmdb(
     agent: &ureq::Agent,
     token: &str,
+    kind: &str,
     title: &str,
-    year: &str,
+    year: Option<&str>,
 ) -> Result<Option<(String, String)>, ureq::Error> {
-    let json: serde_json::Value = agent
-        .get("https://api.themoviedb.org/3/search/movie")
+    let (title_key, date_key, year_key) = match kind {
+        "tv" => ("name", "first_air_date", "first_air_date_year"),
+        _ => ("title", "release_date", "year"),
+    };
+    let mut request = agent
+        .get(format!("https://api.themoviedb.org/3/search/{kind}"))
         .header("Authorization", format!("Bearer {token}"))
-        .query("query", title)
-        .query("year", year)
-        .call()?
-        .body_mut()
-        .read_json()?;
+        .query("query", title);
+    if let Some(year) = year {
+        request = request.query(year_key, year);
+    }
+    let json: serde_json::Value = request.call()?.body_mut().read_json()?;
     let first = &json["results"][0];
-    let title = sanitize(first["title"].as_str().unwrap_or_default());
-    let year = first["release_date"].as_str().and_then(|d| d.get(..4));
+    let title = sanitize(first[title_key].as_str().unwrap_or_default());
+    let year = first[date_key].as_str().and_then(|d| d.get(..4));
     Ok(match year {
         Some(y) if !title.is_empty() && y.parse::<u16>().is_ok() => Some((title, y.into())),
         _ => None,
@@ -189,9 +242,161 @@ fn copy_then_delete(from: &Path, to: &Path) -> io::Result<()> {
     fs::remove_file(from)
 }
 
+fn is_video(p: &Path) -> bool {
+    VIDEO.contains(&ext(p).as_str())
+}
+
+fn is_sub(p: &Path) -> bool {
+    SUBS.contains(&ext(p).as_str())
+}
+
+/// Folder name for a show: one that is already in the library, else TMDB's name,
+/// else the name from the release.
+fn show_folder(cfg: &Config, agent: &ureq::Agent, show: &str, entry_name: &str) -> String {
+    // "Shogun 2024" may be filed as "Shogun.2024" or as plain "Shogun".
+    let (title, year) = match parse(show) {
+        Some((title, year)) => (title, Some(year)),
+        None => (show.to_string(), None),
+    };
+    let existing = |name: &str| existing_folder(&cfg.series, name);
+    if let Some(folder) = existing(show).or_else(|| existing(&title)) {
+        return folder;
+    }
+    if let Some(token) = &cfg.token {
+        match tmdb(agent, token, "tv", &title, year.as_deref()) {
+            Ok(Some((name, _))) => return existing(&name).unwrap_or(name),
+            Ok(None) => cfg.log(format!("{entry_name}: no TMDB match, using parsed name")),
+            Err(e) => cfg.log(format!(
+                "{entry_name}: TMDB failed ({e}), using parsed name"
+            )),
+        }
+    }
+    sanitize(show)
+}
+
+/// Move every episode of a download to `<Show>/Season NN/<Show> - S01E02.<ext>`.
+fn process_series(
+    cfg: &Config,
+    agent: &ureq::Agent,
+    entry: &Path,
+    entry_name: &str,
+    files: &Files,
+) -> io::Result<String> {
+    if !cfg.series.is_dir() {
+        return Ok("an episode, but there is no series folder, left alone".into());
+    }
+    let from_entry = parse_episode(entry_name);
+    let mut folders = HashMap::new();
+    // (video name, episode code, target folder, target name) of each moved episode.
+    let mut moved = Vec::new();
+    let mut left = 0;
+    let episodes = files
+        .iter()
+        .filter(|(p, _)| is_video(p) && !stem(p).to_lowercase().contains("sample"));
+    for (video, _) in episodes {
+        // The episode code comes from the file, else from the folder name. The show
+        // name is the other way round: folder names keep the capitals more often.
+        let own = parse_episode(&stem(video));
+        let code = [&own, &from_entry].into_iter().flatten().next();
+        let mut shows = [&from_entry, &own].into_iter().flatten();
+        let show = shows.find_map(|(show, ..)| Some(sanitize(show)).filter(|s| !s.is_empty()));
+        let (Some((_, season, code)), Some(show)) = (code, show) else {
+            left += 1;
+            continue;
+        };
+        let folder = folders
+            .entry(show.clone())
+            .or_insert_with(|| show_folder(cfg, agent, &show, entry_name));
+        let dir = cfg
+            .series
+            .join(&*folder)
+            .join(format!("Season {season:02}"));
+        let name = format!("{folder} - {code}");
+        let target = dir.join(format!("{name}.{}", ext(video)));
+        if target.exists() {
+            cfg.log(format!(
+                "{entry_name}: {} already exists, left alone",
+                target.display()
+            ));
+            left += 1;
+        } else if cfg.dry_run {
+            cfg.log(format!("{entry_name}: would move to {}", target.display()));
+        } else {
+            fs::create_dir_all(&dir)?;
+            move_file(video, &target)?;
+            cfg.log(format!("{entry_name}: moved to {}", target.display()));
+            moved.push((stem(video), code.clone(), dir, name));
+        }
+    }
+    if cfg.dry_run {
+        return Ok("dry run, nothing moved".into());
+    }
+
+    for (sub, _) in files.iter().filter(|(p, _)| is_sub(p)) {
+        // A subtitle belongs to the video it is named after, or to the same episode code,
+        // or to the only episode of the download.
+        let sub_stem = stem(sub);
+        let code = parse_episode(&sub_stem).map(|(.., code)| code);
+        let owner = moved
+            .iter()
+            .find(|(video, ..)| sub_stem.starts_with(video.as_str()))
+            .or_else(|| moved.iter().find(|(_, c, ..)| Some(c) == code.as_ref()))
+            .or(moved.first().filter(|_| moved.len() == 1));
+        let Some((video, _, dir, name)) = owner else {
+            left += 1;
+            continue;
+        };
+        // Keep ".en" from "Show.S01E02.en"; other endings are not a language.
+        let language = sub_stem.rsplit_once('.').map(|(_, last)| last);
+        let suffix = match (sub_stem.strip_prefix(video.as_str()), language) {
+            (Some(rest), _) => rest.to_string(),
+            (None, Some(l)) if (2..=3).contains(&l.len()) && l.chars().all(char::is_alphabetic) => {
+                format!(".{l}")
+            }
+            _ => String::new(),
+        };
+        let target = dir.join(format!("{name}{suffix}.{}", ext(sub)));
+        if target.exists() {
+            left += 1;
+        } else {
+            move_file(sub, &target)?;
+        }
+    }
+
+    // Delete the rest (samples, thumbnails, nfo) only when nothing of value stayed behind.
+    let big_left = files.iter().any(|(p, m)| m.len() >= BIG && p.exists());
+    if left > 0 || big_left || moved.is_empty() {
+        return Ok(format!(
+            "{} episode(s) moved, source kept: {left} file(s) not placed",
+            moved.len()
+        ));
+    }
+    if entry.is_dir() {
+        fs::remove_dir_all(entry)?;
+    }
+    Ok(format!("{} episode(s) moved", moved.len()))
+}
+
 /// Handle one entry of the source folder. Returns the line to log.
 fn process(cfg: &Config, agent: &ureq::Agent, entry: &Path, files: &Files) -> io::Result<String> {
-    let is_video = |p: &Path| VIDEO.contains(&ext(p).as_str());
+    let entry_name = if entry.is_dir() {
+        entry
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        stem(entry)
+    };
+    let is_episode = |name: &str| parse_episode(name).is_some();
+    if is_episode(&entry_name)
+        || files
+            .iter()
+            .any(|(p, _)| is_video(p) && is_episode(&stem(p)))
+    {
+        return process_series(cfg, agent, entry, &entry_name, files);
+    }
+
     // Every big file counts, video or not: the rest of the folder is deleted later.
     let big: Vec<_> = files.iter().filter(|(_, m)| m.len() >= BIG).collect();
     let mut videos = files.iter().filter(|(p, _)| is_video(p));
@@ -202,15 +407,6 @@ fn process(cfg: &Config, agent: &ureq::Agent, entry: &Path, files: &Files) -> io
         _ => return Ok("not exactly one movie file, left alone".into()),
     };
 
-    let entry_name = if entry.is_dir() {
-        entry
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned()
-    } else {
-        stem(entry)
-    };
     let Some((mut title, mut year)) = parse(&entry_name).or_else(|| parse(&stem(video))) else {
         return Ok("no year in name, left alone".into());
     };
@@ -219,7 +415,7 @@ fn process(cfg: &Config, agent: &ureq::Agent, entry: &Path, files: &Files) -> io
         return Ok("no title in name, left alone".into());
     }
     if let Some(token) = &cfg.token {
-        match tmdb(agent, token, &title, &year) {
+        match tmdb(agent, token, "movie", &title, Some(&year)) {
             Ok(Some(found)) => (title, year) = found,
             Ok(None) => cfg.log(format!("{entry_name}: no TMDB match, using parsed name")),
             Err(e) => cfg.log(format!(
@@ -245,10 +441,7 @@ fn process(cfg: &Config, agent: &ureq::Agent, entry: &Path, files: &Files) -> io
     move_file(video, &target)?;
     let video_stem = stem(video);
     let mut subs_left = false;
-    for (sub, _) in files
-        .iter()
-        .filter(|(p, _)| SUBS.contains(&ext(p).as_str()))
-    {
+    for (sub, _) in files.iter().filter(|(p, _)| is_sub(p)) {
         // "Movie.en.srt" keeps ".en"; an unrelated name like "English.srt" becomes the suffix.
         let sub_stem = stem(sub);
         let suffix = match sub_stem.strip_prefix(&video_stem) {
@@ -275,11 +468,69 @@ fn process(cfg: &Config, agent: &ureq::Agent, entry: &Path, files: &Files) -> io
     Ok(format!("moved to {}", target.display()))
 }
 
+/// What the web page and the scan loop share.
+#[derive(Default)]
+struct Switch {
+    awake: AtomicBool,
+    /// Seconds since 1970 when the service falls asleep; 0 is never.
+    sleep_at: AtomicU64,
+}
+
+/// Answer one request: /start and /stop set the switch, every path shows the state.
+fn answer(mut stream: TcpStream, switch: &Switch, log_dir: Option<&Path>) -> io::Result<()> {
+    // A client that says nothing must not block the next one for long.
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    // Read the whole header: closing with unread data would reset the connection.
+    let mut request = Vec::new();
+    let mut chunk = [0; 1024];
+    while !request.ends_with(b"\r\n\r\n") && request.len() < 16 * 1024 {
+        match stream.read(&mut chunk)? {
+            0 => break,
+            read => request.extend_from_slice(&chunk[..read]),
+        }
+    }
+    let request = String::from_utf8_lossy(&request);
+    match request.split_whitespace().nth(1) {
+        Some("/start") => switch.awake.store(true, Relaxed),
+        Some("/stop") => switch.awake.store(false, Relaxed),
+        _ => {}
+    }
+
+    let minutes_left = switch
+        .sleep_at
+        .load(Relaxed)
+        .saturating_sub(unix_now())
+        .div_ceil(60);
+    let state = match (switch.awake.load(Relaxed), switch.sleep_at.load(Relaxed)) {
+        (false, _) => "Asleep.".to_string(),
+        (true, 0) => "Awake.".to_string(),
+        (true, _) => format!("Awake. Sleeps in {minutes_left} min if nothing new arrives."),
+    };
+    let log = log_dir.and_then(|dir| fs::read_to_string(dir.join(LOG_FILE)).ok());
+    let lines: Vec<&str> = log.as_deref().unwrap_or_default().lines().collect();
+    let recent = lines[lines.len().saturating_sub(20)..].join("\n");
+    let recent = recent.replace('&', "&amp;").replace('<', "&lt;");
+    let page = format!(
+        "<!doctype html><meta name=viewport content='width=device-width'>\
+         <title>movie-mover</title><h1>movie-mover</h1><p>{state}</p>\
+         <p><a href=/start>Start</a> | <a href=/stop>Stop</a> | <a href=/>Refresh</a></p>\
+         <pre>{recent}</pre>"
+    );
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{page}",
+        page.len()
+    )
+}
+
 fn main() {
     let var = |key: &str| env::var(key).ok().filter(|v| !v.is_empty());
     let src = PathBuf::from(var("SRC").unwrap_or("/Download/complete".into()));
     let cfg = Config {
         dst: var("DST").unwrap_or("/film".into()).into(),
+        series: var("SERIES").unwrap_or("/serie".into()).into(),
         token: var("TMDB_TOKEN"),
         dry_run: var("DRY_RUN").is_some_and(|v| v != "0"),
         // Only when the folder is there: without a mapping the log stays on stdout.
@@ -292,17 +543,49 @@ fn main() {
         .unwrap_or(30)
         .max(1);
     let log_days: u64 = var("LOG_DAYS").and_then(|v| v.parse().ok()).unwrap_or(60);
+    let port: u16 = var("PORT").and_then(|v| v.parse().ok()).unwrap_or(8767);
+    let idle_minutes: u64 = var("IDLE_MINUTES")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(15)))
         .build()
         .into();
     cfg.log(format!(
-        "watching {} -> {} every {interval}s, TMDB {}{}",
+        "watching {} -> {} and {} every {interval}s, TMDB {}{}",
         src.display(),
         cfg.dst.display(),
+        cfg.series.display(),
         if cfg.token.is_some() { "on" } else { "off" },
         if cfg.dry_run { ", dry run" } else { "" },
     ));
+
+    // Awake from the start: a restart of the container counts as a start.
+    let switch = Arc::new(Switch::default());
+    switch.awake.store(true, Relaxed);
+    let listening = match TcpListener::bind(("0.0.0.0", port)) {
+        Ok(listener) => {
+            let (switch, log_dir) = (switch.clone(), cfg.log_dir.clone());
+            thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let _ = answer(stream, &switch, log_dir.as_deref());
+                }
+            });
+            true
+        }
+        Err(e) => {
+            cfg.log(format!(
+                "cannot listen on port {port} ({e}), so it never sleeps"
+            ));
+            false
+        }
+    };
+    // Without the page nothing could wake it again.
+    let idle = if listening {
+        idle_minutes.saturating_mul(60)
+    } else {
+        0
+    };
 
     // Entry -> (signature, already handled). An entry is handled once its
     // signature is the same in two scans in a row.
@@ -310,6 +593,8 @@ fn main() {
     // raise INTERVAL if a hand-copied movie ever arrives cut short.
     let mut seen = HashMap::new();
     let mut pruned_day = String::new();
+    let mut was_awake = false;
+    let mut last_activity = unix_now();
     loop {
         // Once a day is enough.
         let today = timestamp(unix_now())[..10].to_string();
@@ -324,6 +609,22 @@ fn main() {
             }
             pruned_day = today;
         }
+
+        let awake = switch.awake.load(Relaxed);
+        if awake != was_awake {
+            was_awake = awake;
+            last_activity = unix_now();
+            // After a sleep every entry has to prove again that it is finished.
+            seen.clear();
+            cfg.log(if awake { "awake" } else { "asleep" }.into());
+        }
+        if !awake {
+            thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+
+        // Something new, changed or handled in this scan.
+        let mut active = false;
         let mut now = HashMap::new();
         match fs::read_dir(&src) {
             Err(e) => cfg.log(format!("cannot read {}: {e}", src.display())),
@@ -352,6 +653,7 @@ fn main() {
                                 || match process(&cfg, &agent, &path, &files) {
                                     Ok(line) => {
                                         cfg.log(format!("{name}: {line}"));
+                                        active = true;
                                         true
                                     }
                                     // Not marked as handled: tried again on the next scan.
@@ -361,14 +663,36 @@ fn main() {
                                     }
                                 }
                         }
-                        _ => false,
+                        _ => {
+                            active = true;
+                            false
+                        }
                     };
                     now.insert(path, (sig, handled));
                 }
             }
         }
         seen = now;
-        thread::sleep(Duration::from_secs(interval));
+
+        if active {
+            last_activity = unix_now();
+        }
+        if idle > 0 {
+            let sleep_at = last_activity.saturating_add(idle);
+            switch.sleep_at.store(sleep_at, Relaxed);
+            if unix_now() >= sleep_at {
+                cfg.log(format!("nothing new for {idle_minutes} min"));
+                switch.awake.store(false, Relaxed);
+                continue;
+            }
+        }
+        // In steps of a second, so a start or stop is noticed at once.
+        for _ in 0..interval {
+            if !switch.awake.load(Relaxed) {
+                break;
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
     }
 }
 
@@ -441,9 +765,9 @@ mod tests {
 
         let mut cfg = Config {
             dst: root.join("film"),
-            token: None,
             dry_run: true,
             log_dir: None,
+            ..Default::default()
         };
         let agent = ureq::Agent::new_with_defaults();
         let mut files = Files::new();
@@ -492,9 +816,9 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let cfg = Config {
             dst: root.join("film"),
-            token: None,
             dry_run: false,
             log_dir: None,
+            ..Default::default()
         };
         let agent = ureq::Agent::new_with_defaults();
         let movie = root.join("film/S/Some Movie (2020)");
@@ -564,9 +888,9 @@ mod tests {
 
         let cfg = Config {
             dst: dir.clone(),
-            token: None,
             dry_run: true,
             log_dir: Some(dir.clone()),
+            ..Default::default()
         };
         cfg.log("hello".into());
         prune_log(&dir, now - 30 * 86400).unwrap();
@@ -576,5 +900,108 @@ mod tests {
         assert_eq!(lines[0], format!("{recent} recent"));
         assert!(lines[1].ends_with(" hello"));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reads_episode_codes() {
+        let p = |n| parse_episode(n).map(|(show, season, code)| format!("{show}|{season}|{code}"));
+        assert_eq!(
+            p("Shogun.2024.S01E02.1080p.WEB").unwrap(),
+            "Shogun 2024|1|S01E02"
+        );
+        assert_eq!(p("the.show.s1e2.720p").unwrap(), "the show|1|S01E02");
+        assert_eq!(p("Show S02E05E06 Double").unwrap(), "Show|2|S02E05E06");
+        assert_eq!(p("S03E04"), Some("|3|S03E04".into()));
+        assert_eq!(p("Se7en.1995.1080p"), None);
+        assert_eq!(p("Fall.2.Deadpoint.2026"), None);
+    }
+
+    #[test]
+    fn files_a_season_pack() {
+        let root = env::temp_dir().join(format!("movie-mover-series-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mut cfg = Config {
+            dst: root.join("film"),
+            series: root.join("serie"),
+            ..Default::default()
+        };
+        let agent = ureq::Agent::new_with_defaults();
+        let pack = [
+            "Shogun.2024.S01E01.1080p.mkv",
+            "Shogun.2024.S01E01.1080p.da.srt",
+            "Shogun.2024.S01E02.1080p.mkv",
+            "Subs/shogun.2024.s01e02.en.srt",
+            "sample-shogun.s01e01.mkv",
+            "info.nfo",
+        ];
+        let make = |names: &[&str]| {
+            let dir = root.join("complete/Shogun.2024.S01.1080p.WEB");
+            for name in names {
+                fs::create_dir_all(dir.join(name).parent().unwrap()).unwrap();
+                fs::write(dir.join(name), "x").unwrap();
+            }
+            let mut files = Files::new();
+            walk(&dir, &mut files).unwrap();
+            (dir, files)
+        };
+
+        // Without a series folder an episode is not filed, and never as a movie.
+        let (dir, files) = make(&pack);
+        process(&cfg, &agent, &dir, &files).unwrap();
+        assert!(dir.join(pack[0]).exists() && !root.join("film").exists());
+
+        // The show folder that is already there is used, whatever its punctuation.
+        let season = root.join("serie/Shogun.2024/Season 01");
+        fs::create_dir_all(root.join("serie/Shogun.2024")).unwrap();
+        cfg.dry_run = true;
+        process(&cfg, &agent, &dir, &files).unwrap();
+        assert!(
+            dir.join(pack[0]).exists() && !season.exists(),
+            "dry run changes nothing"
+        );
+        cfg.dry_run = false;
+        process(&cfg, &agent, &dir, &files).unwrap();
+        for name in ["S01E01.mkv", "S01E01.da.srt", "S01E02.mkv", "S01E02.en.srt"] {
+            assert!(
+                season.join(format!("Shogun.2024 - {name}")).exists(),
+                "{name}"
+            );
+        }
+        assert!(!dir.exists(), "sample and nfo go with the folder");
+
+        // An episode that is already in the library stays in the download folder.
+        let (dir, files) = make(&[
+            "Shogun.2024.S01E02.1080p.mkv",
+            "Shogun.2024.S01E03.1080p.mkv",
+        ]);
+        process(&cfg, &agent, &dir, &files).unwrap();
+        assert!(season.join("Shogun.2024 - S01E03.mkv").exists());
+        assert!(dir.join("Shogun.2024.S01E02.1080p.mkv").exists());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn page_starts_and_stops() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let switch = Arc::new(Switch::default());
+        let served = switch.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let _ = answer(stream, &served, None);
+            }
+        });
+        let get = |path: &str| {
+            let mut stream = TcpStream::connect(address).unwrap();
+            write!(stream, "GET {path} HTTP/1.1\r\n\r\n").unwrap();
+            let mut reply = String::new();
+            stream.read_to_string(&mut reply).unwrap();
+            reply
+        };
+        assert!(get("/").contains("Asleep."));
+        assert!(get("/start").starts_with("HTTP/1.1 200 OK") && switch.awake.load(Relaxed));
+        assert!(get("/favicon.ico").contains("Awake.") && switch.awake.load(Relaxed));
+        assert!(get("/stop").contains("Asleep.") && !switch.awake.load(Relaxed));
     }
 }

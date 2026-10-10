@@ -8,7 +8,10 @@ services:
     environment:
       TMDB_TOKEN: ""
       DRY_RUN: "1"
+    ports:
+      - "8767:8767"
     volumes:
       - /volume1/download/complete:/Download/complete
       - /volume1/film:/film
+      - /volume1/serie:/serie
       - /volume1/docker/movie-mover:/data

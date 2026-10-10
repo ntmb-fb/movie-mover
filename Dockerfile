@@ -10,9 +10,13 @@ COPY --from=build /app/target/release/movie-mover /movie-mover
 # Listed so container UIs show the settings with their defaults.
 ENV SRC=/Download/complete \
     DST=/film \
+    SERIES=/serie \
     TMDB_TOKEN="" \
     INTERVAL=30 \
+    IDLE_MINUTES=60 \
+    PORT=8767 \
     DRY_RUN="" \
     LOG_DIR=/data \
     LOG_DAYS=60
+EXPOSE 8767
 ENTRYPOINT ["/movie-mover"]
