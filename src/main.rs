@@ -481,9 +481,12 @@ struct Switch {
     awake: AtomicBool,
     /// Seconds since 1970 when the service falls asleep; 0 is never.
     sleep_at: AtomicU64,
+    /// Seconds between scans, changed with /interval/<seconds>.
+    interval: AtomicU64,
 }
 
-/// Answer one request: /start and /stop set the switch, every path shows the state.
+/// Answer one request: /start, /stop and /interval/<seconds> set the switch,
+/// every path shows the state.
 fn answer(mut stream: TcpStream, switch: &Switch, log_dir: Option<&Path>) -> io::Result<()> {
     // A client that says nothing must not block the next one for long.
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -501,7 +504,15 @@ fn answer(mut stream: TcpStream, switch: &Switch, log_dir: Option<&Path>) -> io:
     match request.split_whitespace().nth(1) {
         Some("/start") => switch.awake.store(true, Relaxed),
         Some("/stop") => switch.awake.store(false, Relaxed),
-        _ => {}
+        Some(path) => {
+            let seconds = path
+                .strip_prefix("/interval/")
+                .and_then(|s| s.parse::<u64>().ok());
+            if let Some(seconds) = seconds.filter(|s| *s > 0) {
+                switch.interval.store(seconds, Relaxed);
+            }
+        }
+        None => {}
     }
 
     let minutes_left = switch
@@ -520,9 +531,11 @@ fn answer(mut stream: TcpStream, switch: &Switch, log_dir: Option<&Path>) -> io:
     let recent = recent.replace('&', "&amp;").replace('<', "&lt;");
     let page = format!(
         "<!doctype html><meta name=viewport content='width=device-width'>\
-         <title>movie-mover</title><h1>movie-mover</h1><p>{state}</p>\
+         <title>movie-mover</title><h1>movie-mover</h1><p>{state} Scans every {}s (<a href=/interval/5>5</a> | \
+         <a href=/interval/30>30</a> | <a href=/interval/300>300</a>).</p>\
          <p><a href=/start>Start</a> | <a href=/stop>Stop</a> | <a href=/>Refresh</a></p>\
-         <pre>{recent}</pre>"
+         <pre>{recent}</pre>",
+        switch.interval.load(Relaxed)
     );
     write!(
         stream,
@@ -570,6 +583,7 @@ fn main() {
     // Awake from the start: a restart of the container counts as a start.
     let switch = Arc::new(Switch::default());
     switch.awake.store(true, Relaxed);
+    switch.interval.store(interval, Relaxed);
     let listening = match TcpListener::bind(("0.0.0.0", port)) {
         Ok(listener) => {
             let (switch, log_dir) = (switch.clone(), cfg.log_dir.clone());
@@ -694,7 +708,7 @@ fn main() {
             }
         }
         // In steps of a second, so a start or stop is noticed at once.
-        for _ in 0..interval {
+        for _ in 0..switch.interval.load(Relaxed) {
             if !switch.awake.load(Relaxed) {
                 break;
             }
@@ -1016,5 +1030,9 @@ mod tests {
         assert!(get("/start").starts_with("HTTP/1.1 200 OK") && switch.awake.load(Relaxed));
         assert!(get("/favicon.ico").contains("Awake.") && switch.awake.load(Relaxed));
         assert!(get("/stop").contains("Asleep.") && !switch.awake.load(Relaxed));
+        get("/interval/7");
+        get("/interval/0");
+        get("/interval/x");
+        assert_eq!(switch.interval.load(Relaxed), 7);
     }
 }
